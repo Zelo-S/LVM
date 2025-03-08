@@ -1,3 +1,4 @@
+import time
 """
 Batch generation for sequnce of images. This script accept a jsonl file
 as input. Each line of the jsonl file representing a dictionary. Each line
@@ -10,23 +11,36 @@ Ths script runs the mode to generate the output images, and concatenate the
 input and output images together and save them to the output path.
 """
 
+import natsort
+from datetime import datetime
+import gc
+import pathlib
 import os
 import json
 from PIL import Image
 import numpy as np
 import mlxu
 from tqdm import tqdm, trange
-from multiprocessing import Pool
+from multiprocessing import Pool, set_start_method
 import einops
 import torch
+from pathlib import Path
 
-from .inference import MultiProcessInferenceModel
-from .utils import read_image_to_tensor, MultiProcessImageSaver
+import matplotlib.pyplot as plt
 
+from inference import MultiProcessInferenceModel
+from utils import read_image_to_tensor, MultiProcessImageSaver
+
+import inspect2
+LOG = True
+def log(str_):
+    f = inspect2.currentframe()
+    i = inspect2.getframeinfo(f.f_back)
+    if LOG: print(f"{i.filename}:{i.lineno} --> {i.function} -> {str_}")
 
 FLAGS, _ = mlxu.define_flags_with_default(
-    input_file='',
-    checkpoint='',
+    input_file='./input.json', # not used rn
+    checkpoint='../LVM_ckpts',
     input_base_dir='',
     output_base_dir='',
     evaluate_mse=False,
@@ -34,16 +48,16 @@ FLAGS, _ = mlxu.define_flags_with_default(
     json_output_key='output',
     json_target_key='target',
     n_new_frames=1,
-    n_candidates=2,
+    n_candidates=5,
     context_frames=16,
     temperature=1.0,
     top_p=1.0,
-    n_workers=8,
+    n_workers=1,
     dtype='float16',
     torch_devices='',
-    batch_size_factor=4,
+    batch_size_factor=1,
     max_examples=0,
-    resize_output='',
+    resize_output='original',
     include_input=False,
 )
 
@@ -76,13 +90,15 @@ class MultiFrameDataset(torch.utils.data.Dataset):
 
 
 def main(_):
-    assert FLAGS.checkpoint != ''
 
+    log(f"Clearning memory: {torch.cuda.empty_cache()} {gc.collect()}")
+
+    assert FLAGS.checkpoint != ''
+    set_start_method('spawn')
     print(f'Loading checkpoint from {FLAGS.checkpoint}')
     print(f'Evaluating input file from {FLAGS.input_file}')
-
+    log(f"Dtype: {FLAGS.dtype}")
     # build a model.
-
     model = MultiProcessInferenceModel(
         checkpoint=FLAGS.checkpoint,
         torch_devices=FLAGS.torch_devices,
@@ -108,7 +124,6 @@ def main(_):
             if FLAGS.evaluate_mse:
                 target_files.append(record[FLAGS.json_target_key])
 
-
     if FLAGS.max_examples > 0:
         input_files = input_files[:FLAGS.max_examples]
         output_files = output_files[:FLAGS.max_examples]
@@ -132,22 +147,77 @@ def main(_):
             os.path.join(FLAGS.output_base_dir, x)
             for x in output_files
         ]
+    
+    root_dir = "/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im0/"
+    directory = pathlib.Path(root_dir)
+    input_file_names = [natsort.natsorted([root_dir + f.name for f in directory.iterdir() if f.is_file()])]
+    input_files[0] = input_files[0][:-1]
+    print(input_file_names)
+    dataset = MultiFrameDataset(input_file_names, output_files, target_files)
 
-    dataset = MultiFrameDataset(input_files, output_files, target_files)
+
+    input_ims, _, output_im, og_size = dataset.__getitem__(0)
+    log(input_ims.shape)
+    log(output_im)
+    log(og_size)
 
     data_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=FLAGS.batch_size_factor * model.n_processes,
+        # batch_size=FLAGS.batch_size_factor * model.n_processes,
+        batch_size=1,
         shuffle=False,
-        num_workers=FLAGS.n_workers,
+        num_workers=0,
     )
+    
+    # log("Done with dataloader")
 
+    # batch_images is input.
+    
+    input_ims = np.expand_dims(input_ims, axis=0)
+    log(f"Post expansion input im shape: {input_ims.shape}")
+
+    context_length = input_ims.shape[1]
+    log(f"Ctx Length: {context_length}")
+    
+    
+    generated_images = model(
+        input_ims,
+        FLAGS.n_new_frames,
+        FLAGS.n_candidates,
+        temperature=FLAGS.temperature,
+        top_p=FLAGS.top_p
+    )
+    
+    log(f"\nCuda usage: {torch.cuda.utilization()}\n")
+    
+    log(f"Generated Images Shape: {len(generated_images)} {generated_images[0][0].shape}")
+
+    for i in range(len(input_ims[0])):
+        im = input_ims[0][i]
+        plt.subplot(1,len(input_ims[0]), i+1)
+        plt.xticks([])
+        plt.yticks([])
+        plt.title(f"Image {i}")
+        plt.imshow(im)
+
+    print(len(generated_images[0]))
+    for candidate in generated_images[0]:
+        print("Candidate:", np.asarray(candidate).shape)
+        im = Image.fromarray((candidate[0] * 255).astype(np.uint8))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = root_dir + "output/"
+        os.makedirs(save_dir, exist_ok=True)
+        im.save(save_dir + f"output_image_{timestamp}.jpg")
+        time.sleep(1.1)
+        print("Saving image")
+
+    """
     image_saver = MultiProcessImageSaver(FLAGS.n_workers)
 
     mses = []
 
     for batch_images, batch_targets, batch_output_files, batch_sizes in tqdm(data_loader, ncols=0):
-        
+        log("Separating data loader")
         # batch_images is input.
         batch_images = batch_images.numpy()
 
@@ -212,12 +282,12 @@ def main(_):
             resizes = resizes * np.array([[n_frames, FLAGS.n_candidates]])
 
         image_saver(combined, batch_output_files, resizes)
-
     if FLAGS.evaluate_mse:
         mses = np.concatenate(mses, axis=0)
         print(f'MSE: {np.mean(mses)}')
 
     image_saver.close()
+    """
 
 if __name__ == "__main__":
     mlxu.run(main)
