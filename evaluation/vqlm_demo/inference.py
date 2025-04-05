@@ -1,10 +1,14 @@
+from accelerate import load_checkpoint_and_dispatch, init_empty_weights, infer_auto_device_map
+import gc
+
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 import time
 import os
 from functools import partial
 from copy import deepcopy
-from multiprocessing import Pool
+# from multiprocessing import Pool
+from multiprocess.pool import Pool
 from threading import Lock
 from PIL import Image
 import numpy as np
@@ -13,8 +17,8 @@ import torch.nn.functional as F
 import einops
 from transformers import LlamaForCausalLM
 
-from .vqvae_muse import VQGANModel, get_tokenizer_muse
-from .torch_vqvae_model import get_tokenizer
+from vqvae_muse import VQGANModel, get_tokenizer_muse
+from torch_vqvae_model import get_tokenizer
 
 
 def get_torch_float_dtype(dtype):
@@ -36,6 +40,14 @@ def get_pid():
     time.sleep(1)
     return os.getpid()
 
+import inspect2
+LOG = False
+
+def log(str_):
+    f = inspect2.currentframe()
+    i = inspect2.getframeinfo(f.f_back)
+    if LOG:
+        print(f"{i.filename}:{i.lineno} --> {i.function} -> {str_}")
 
 class InferenceModel(ABC):
 
@@ -61,14 +73,29 @@ class LocalInferenceModel(InferenceModel):
         self.tokenizer = get_tokenizer_muse()
         self.tokenizer.to(self.torch_device)
 
-        self.model = LlamaForCausalLM.from_pretrained(
-            self.checkpoint, torch_dtype=get_torch_float_dtype(self.dtype)
-        ).to(self.torch_device)
+        with init_empty_weights():
+            self.model = LlamaForCausalLM.from_pretrained(
+                self.checkpoint, torch_dtype=get_torch_float_dtype(self.dtype)
+            ) # .to(self.torch_device)
+        
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        device_map = infer_auto_device_map(self.model, max_memory={0: "4GB", 1: "6GB", 2: "6GB", 3: "12GB", "cpu": "25GB"})
+        self.model = load_checkpoint_and_dispatch(
+            self.model, self.checkpoint, device_map=device_map, offload_folder="./offload"
+        )
+
+        log(f"Printing params...")
+        for i in self.model.named_parameters():
+            print(f"{i[0]} -> {i[1].device}")
+        log(f"DONE Printing params...")
 
         if use_lock:
             self.lock = Lock()
         else:
             self.lock = nullcontext()
+        
 
     @torch.no_grad()
     def compute_perplexity(self, input_images, target_images):
@@ -104,11 +131,10 @@ class LocalInferenceModel(InferenceModel):
         assert type(input_images) == np.ndarray
         with self.lock:
             input_images = np.array(input_images, dtype=np.float32)
+            log(f"Input images.shape: {input_images.shape}")
             input_images = torch.tensor(
                 einops.rearrange(input_images, 'b h w c -> b c h w')
             ).to(self.torch_device)
-
-            print('here:', type(input_images))
 
             # old tokenizer
             # input_ids = self.tokenizer.tokenize(input_images).view(1, -1)
@@ -116,7 +142,6 @@ class LocalInferenceModel(InferenceModel):
             # new tokenizer
             _, input_ids = self.tokenizer.encode(input_images)
             input_ids = input_ids.view(1, -1)
-
 
             input_ids = input_ids[:, -(self.context_frames - 1) * 256:]
 
@@ -161,6 +186,7 @@ class LocalInferenceModel(InferenceModel):
     def __call__(self, input_images, n_new_frames, n_candidates, temperature=1.0, top_p=1.0):
         output = []
         for seq in input_images:
+            log(f"Seq: {seq}")
             output.append(
                 [self.generate_once(seq, n_new_frames, temperature, top_p)
                  for _ in range(n_candidates)]
@@ -176,7 +202,7 @@ class MultiProcessInferenceModel(InferenceModel):
             torch_devices = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
 
         self.torch_devices = torch_devices
-        self.n_processes = len(torch_devices)
+        self.n_processes = 1 # len(torch_devices)
         print(f'Using {self.n_processes} processes for inference')
         self.worker_pool = Pool(self.n_processes)
         self.worker_pids = self.worker_pool.starmap(get_pid, [tuple() for _ in range(self.n_processes)])
@@ -194,6 +220,7 @@ class MultiProcessInferenceModel(InferenceModel):
         else:
             self.lock = nullcontext()
 
+
     @staticmethod
     def initialize_worker(device_map, checkpoint, dtype, context_frames):
         global _current_process_backend
@@ -201,6 +228,7 @@ class MultiProcessInferenceModel(InferenceModel):
         _current_process_backend = LocalInferenceModel(
             checkpoint, dtype, torch_device, context_frames
         )
+        print("Initialize workers here...")
 
     @staticmethod
     def generate_once(input_images, n_new_frames, temperature=1.0, top_p=1.0):
@@ -224,11 +252,13 @@ class MultiProcessInferenceModel(InferenceModel):
     def __call__(self, input_images, n_new_frames, n_candidates, temperature=1.0, top_p=1.0):
         with self.lock:
             map_args = []
-            for seq in input_images:
+            for seq in input_images: # TODO: input_images is of shape (b h w c)
                 for _ in range(n_candidates):
                     map_args.append((seq, n_new_frames, temperature, top_p))
 
+            log(len(map_args))
             outputs = self.worker_pool.starmap(self.generate_once, map_args)
+
             reshaped_output = []
             index = 0
             for _ in range(len(input_images)):
@@ -237,5 +267,6 @@ class MultiProcessInferenceModel(InferenceModel):
                     candidates.append(outputs[index])
                     index += 1
                 reshaped_output.append(candidates)
+        log(f"Reshape output shape: {np.asarray(reshaped_output).shape}")
         return reshaped_output
 
