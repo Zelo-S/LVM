@@ -1,64 +1,29 @@
-import clip
 from PIL import Image
 import numpy as np
 import torch
 import torch.nn.functional as F
-import einops
 
-from vqvae_muse import get_tokenizer_muse
-from torch_vqvae_model import get_tokenizer
 import matplotlib.pyplot as plt
 
-from utils import read_image_to_tensor
 import torch.nn as nn
+import open_clip
 
-# print(f"Devices available are: {torch.cuda.device_count()}")
+print(f"Pretrained models: {open_clip.list_pretrained()}")
 
 device = "cuda:0"
-"""
-tokenizer = get_tokenizer_muse()
-input_images = []
-tokenizer.to(device)
 
-# TODO: open ground images(base)
-ground_truth_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im0/im_49.jpg")).unsqueeze(0)
-ground_fake_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im0/output/output_image_20250308_161451.jpg")).unsqueeze(0)
+model, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
+model.eval()  # model in train mode by default, impacts some models with BatchNorm or stochastic depth active
+tokenizer = open_clip.get_tokenizer('ViT-L-14')
 
-# TODO: open compare images(very very similar to base, in the same scene+object layout but different object orientations)
-compare_truth_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im4/im_46.jpg")).unsqueeze(0)
-compare_fake_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im4/output/output_image_20250308_172806.jpg")).unsqueeze(0)
-
-# TODO: open compare_medium images(slightly similar to base, in the same scene layout but different objects + orientations)
-compare_medium_truth_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/soft_objects/im0/im_49.jpg")).unsqueeze(0)
-compare_medium_fake_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/soft_objects/im0/output/output_image_20250308_192949.jpg")).unsqueeze(0)
-
-# TODO: open compare_hard images(not anything like base images at all)
-compare_hard_truth_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/bin_obj/im0/im_50.jpg")).unsqueeze(0)
-compare_hard_fake_image = torch.tensor(read_image_to_tensor("/home/stevex2/data/vision-data/bridge_v2/bin_obj/im0/output/output_image_20250311_234204.jpg")).unsqueeze(0)
-"""
-
-model, preprocess = clip.load("ViT-B/32", device=device)
-ground_truth_image = preprocess(Image.open("/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im1/im_49.jpg")).unsqueeze(0).to(device)
-
-"""
-ground_truth_text_desc = clip.tokenize([
-    "a robot arm positioned above a blue teddy bear, a brown teddy bear, a pink rabbit on the right", # TODO: soft_objects/im0/im_49.jpg
-    "a robot arm positioned above a black teddy bear, a white teddy bear, a green rabbit on the right", # TODO: same as above, but wrong colors
-    "a robot arm positioned above a blue cube, a yellow banana, and a green cucumber", # TODO: rigid_objects/im0/im_49.jpg
-    "a robot arm positioned above a brown cube, an orange banana, and a black cucumber", # TODO: same as above, but wrong colors
-    "a robot arm sweeping a piece of yellow cloth", # TODO: sweep/im0/im_29.jpg
-    "a robot arm eating a piece of yellow cloth", # TODO: same as above but wrong action type
-    "a picture of a kitchen scene", # TODO: any of these can be kitchen scenes
-]).to(device)
-"""
-
+ground_truth_image = preprocess(Image.open("/home/stevex2/data/vision-data/bridge_v2/rigid_objects/im0/im_49.jpg")).unsqueeze(0) # .to(device)
 
 # TODO: taken from Bridge V2 Eval Slides, 
 # TODO: first text description is VQA generated for an LVM output on rigid_objects: Move-cucumber
 # TODO: second text description is VQA generated for rigid_objects: GT
 # TODO: third text description is VQA generated for an LVM output on soft_objects: Move Green Bear Right
 # TODO: second text description is VQA generated for soft_objects: GT
-ground_truth_text_desc = clip.tokenize([
+ground_truth_text_desc = tokenizer([
     "The robot arm has moved from its initial position in the first image to a new location above the wooden surface in the second image," +
     " indicating that it has been repositioned for interaction with the objects. A yellow banana-shaped object has been added to the scene" +
     " on the right side of the wooden surface in the second image. It is not present in the first image. A green cucumber-shaped object has" +
@@ -100,20 +65,24 @@ ground_truth_text_desc = clip.tokenize([
     " other toys around them. Overall, the changes suggest that the robot arm was used to move the green frog-shaped toy and the brown bear-like toy to" + 
     " new locations on the wooden surface."
 
-], context_length=)
+])
 
-with torch.no_grad():
+with torch.no_grad(), torch.autocast("cuda"):
     image_tok = model.encode_image(ground_truth_image)
     text_tok = model.encode_text(ground_truth_text_desc)
     
-    logits_per_image, logits_per_text = model(ground_truth_image, ground_truth_text_desc)
-    
-    # print(f"Image logits: {logits_per_image} \n with shape {logits_per_image.shape}")
-    # print(f"Text logits: {logits_per_text} \n with shape {logits_per_text.shape}")
+    # print(image_tok)
+    # print(text_tok)
+
+    image_tok /= image_tok.norm(dim=-1, keepdim=True)
+    text_tok /= text_tok.norm(dim=-1, keepdim=True)
 
     np.set_printoptions(suppress=True)
-    image_probs = logits_per_image.softmax(dim=-1).cpu().numpy().squeeze(0)
-    text_probs = logits_per_text.softmax(dim=0).cpu().numpy().squeeze(1)
+    text_probs = (100.0 * image_tok @ text_tok.T).softmax(dim=-1)
     
-print(f"Truth Image Probabilities: {image_probs}")
-print(f"Truth Text Probabilities
+    # image_probs = logits_per_image.softmax(dim=-1).cpu().numpy().squeeze(0)
+    # text_probs = logits_per_text.softmax(dim=0).cpu().numpy().squeeze(1)
+    
+# print(f"Truth Image Probabilities: {image_probs}")
+np.set_printoptions(suppress=True)
+print(f"Truth Text Probabilities {text_probs}")
